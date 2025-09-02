@@ -3,7 +3,6 @@ from typing import Any, List, Dict, Union
 from dataclasses import dataclass
 
 import torch
-from transformers import PreTrainedTokenizer
 from transformers.trainer import Trainer
 from transformers.trainer_utils import PredictionOutput
 
@@ -20,75 +19,41 @@ class Span:
     end_mask: List[int]
     span_mask: List[int]
 
+
 @dataclass
 class BinderDataCollator:
-    tokenizer: PreTrainedTokenizer
-    id2label: dict[str, dict[int, str]]
+    type_input_ids: torch.Tensor
+    type_attention_mask: torch.Tensor
+    type_token_type_ids: torch.Tensor
+
+    def __post_init__(self):
+        self.type_input_ids = torch.tensor(self.type_input_ids)
+        self.type_attention_mask = torch.tensor(self.type_attention_mask)
+        if self.type_token_type_ids is not None:
+            self.type_token_type_ids = torch.tensor(self.type_token_type_ids)
 
     def __call__(self, features: List) -> Dict[str, Any]:
         batch = {}
-        stage = features[0]['split']
-
         batch['input_ids'] = torch.tensor([f['input_ids'] for f in features], dtype=torch.long)
         batch['attention_mask'] = torch.tensor([f['attention_mask'] for f in features], dtype=torch.bool)
         if "token_type_ids" in features[0]:
             batch['token_type_ids'] = torch.tensor([f['token_type_ids'] for f in features], dtype=torch.long)
 
-        if stage == 'train':
-            batch_labels = set([ann['type'] for feature in features for ann in feature['ner']])
-            batch_id2label = {i: label for i, label in enumerate(batch_labels)}
-            batch_label2id = {label: i for i, label in enumerate(batch_labels)}
-        elif stage == 'eval' or stage == 'predict':
-            batch_id2label = self.id2label[stage]
-            batch_label2id = {v: k for k, v in batch_id2label.items()}
-        else:
-            raise ValueError(f"Unknown stage: {stage}")
+        batch['type_input_ids'] = self.type_input_ids
+        batch['type_attention_mask'] = self.type_attention_mask
+        if self.type_token_type_ids is not None:
+            batch['type_token_type_ids'] = self.type_token_type_ids
 
-        tokenized_labels = self.tokenizer(
-            list(batch_id2label.values()),
-            padding=True,
-            truncation=True,
-            return_tensors="pt",
-        )
-        batch['type_input_ids'] = tokenized_labels['input_ids']
-        batch['type_attention_mask'] = tokenized_labels['attention_mask']
-        if 'token_type_ids' in tokenized_labels:
-            batch['type_token_type_ids'] = tokenized_labels['token_type_ids']
-
-        if stage == 'train':
-            annotations = []
-            for feature in features:
-                token_start_mask = feature['token_start_mask']
-                token_end_mask = feature['token_end_mask']
-                default_span_mask = feature['default_span_mask']
-
-                start_negative_mask = [token_start_mask[:] for _ in batch_id2label]
-                end_negative_mask = [token_end_mask[:] for _ in batch_id2label]
-                span_negative_mask = [[x[:] for x in default_span_mask] for _ in batch_id2label]
-
-                # Exclude the start/end of the NER span.
-                for ann in feature['ner']:
-                    start_negative_mask[batch_label2id[ann['type']]][ann['start']] = 0
-                    end_negative_mask[batch_label2id[ann['type']]][ann['end']] = 0
-                    span_negative_mask[batch_label2id[ann['type']]][ann['start']][ann['end']] = 0
-
-                annotations.append({
-                    "annotations": feature['ner'],
-                    "start_negative_mask": start_negative_mask,
-                    "end_negative_mask": end_negative_mask,
-                    "span_negative_mask": span_negative_mask,
-                })
-            
-
+        if 'ner' in features[0]:
             # For training
             ner = {}
             # Collate negative mask with shape [batch_size, num_types, ...].
             start_negative_mask, end_negative_mask, span_negative_mask = [], [], []
             # [batch_size, num_types, seq_length]
-            start_negative_mask = torch.tensor([a["start_negative_mask"] for a in annotations], dtype=torch.bool)
-            end_negative_mask = torch.tensor([a["end_negative_mask"] for a in annotations], dtype=torch.bool)
+            start_negative_mask = torch.tensor([f["ner"]["start_negative_mask"] for f in features], dtype=torch.bool)
+            end_negative_mask = torch.tensor([f["ner"]["end_negative_mask"] for f in features], dtype=torch.bool)
             # [batch_size, num_types, seq_length, seq_length]
-            span_negative_mask = torch.tensor([a["span_negative_mask"] for a in annotations], dtype=torch.bool)
+            span_negative_mask = torch.tensor([f["ner"]["span_negative_mask"] for f in features], dtype=torch.bool)
             # Include [CLS]
             start_negative_mask[:, :, 0] = 1
             end_negative_mask[:, :, 0] = 1
@@ -100,10 +65,10 @@ class BinderDataCollator:
 
             # Collate mention span examples.
             feature_spans = []
-            for feature_id, feature in enumerate(features):
+            for feature_id, f in enumerate(features):
                 spans = []
-                for ann in feature["ner"]:
-                    type_id, start, end = batch_label2id[ann["type"]], ann["start"], ann["end"]
+                for ann in f['ner']['annotations']:
+                    type_id, start, end = ann["type_id"], ann["start"], ann["end"]
 
                     start_mask = start_negative_mask[feature_id][type_id].detach().clone()
                     start_mask[start] = 1

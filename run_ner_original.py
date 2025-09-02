@@ -22,9 +22,9 @@ from transformers import (
 )
 from transformers.trainer_utils import get_last_checkpoint
 
-from src.config import BinderConfig
-from src.model import Binder
-from src.trainer import BinderDataCollator, BinderTrainer
+from src.config_original import BinderConfig
+from src.model_original import Binder
+from src.trainer_original import BinderDataCollator, BinderTrainer
 from src import utils as postprocess_utils
 
 
@@ -287,6 +287,7 @@ def main():
         data_files["test"] = data_args.test_file
         extension = data_args.test_file.split(".")[-1]
     raw_datasets = load_dataset(extension, data_files=data_files, cache_dir=model_args.cache_dir)
+    raw_datasets['train'] = raw_datasets['train'].select(range(2))
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
 

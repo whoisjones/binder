@@ -6,7 +6,6 @@ import torch.nn.functional as F
 import numpy as np
 from transformers import PreTrainedModel, AutoModel, AutoConfig
 from transformers.file_utils import ModelOutput
-from .config import BinderConfig
 
 
 def tiny_value_of_dtype(dtype: torch.dtype):
@@ -90,7 +89,6 @@ class BinderModelOutput(ModelOutput):
 
 
 class Binder(PreTrainedModel):
-    config_class = BinderConfig
 
     def __init__(self, config):
         super().__init__(config)
@@ -183,9 +181,9 @@ class Binder(PreTrainedModel):
         sequence_output = outputs[0]
 
         type_outputs = self.type_encoder(
-            type_input_ids,
-            attention_mask=type_attention_mask,
-            token_type_ids=type_token_type_ids if type_token_type_ids is not None else None,
+            type_input_ids.squeeze(0),
+            attention_mask=type_attention_mask.squeeze(0),
+            token_type_ids=type_token_type_ids.squeeze(0) if type_token_type_ids is not None else None,
             return_dict=return_dict,
         )
         # num_types x hidden_size
@@ -257,9 +255,9 @@ class Binder(PreTrainedModel):
             ner_start_masks, ner_end_masks = ner["example_start_masks"], ner["example_end_masks"]
             ner_span_masks = ner["example_span_masks"]
 
-            start_loss = contrastive_loss(start_scores[tuple(ner_indices)], ner_starts, ner_start_masks)
-            end_loss = contrastive_loss(end_scores[tuple(ner_indices)], ner_ends, ner_end_masks)
-            span_loss = contrastive_loss(span_scores[tuple(ner_indices)], (ner_starts, ner_ends), ner_span_masks)
+            start_loss = contrastive_loss(start_scores[ner_indices], ner_starts, ner_start_masks)
+            end_loss = contrastive_loss(end_scores[ner_indices], ner_ends, ner_end_masks)
+            span_loss = contrastive_loss(span_scores[ner_indices], (ner_starts, ner_ends), ner_span_masks)
 
             total_loss = (
                 self.start_loss_weight * start_loss +
