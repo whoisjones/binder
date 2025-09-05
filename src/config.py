@@ -36,3 +36,30 @@ class BinderConfig(PretrainedConfig):
         self.threshold_loss_weight = threshold_loss_weight
         self.ner_loss_weight = ner_loss_weight
         super().__init__(**kwargs)
+
+class BinderFocalConfig(PretrainedConfig):
+    model_type = "binder_focal"
+
+    def __init__(
+        self,
+        text_encoder=None,
+        type_encoder=None,
+        dropout=0.1,
+        max_span_width=30,
+        use_span_width_embedding=True,
+        linear_size=384,
+        start_loss_weight=0.2,
+        end_loss_weight=0.2,
+        span_loss_weight=0.6,
+        **kwargs,
+    ):
+        self.text_encoder = text_encoder
+        self.type_encoder = type_encoder
+        self.dropout = dropout
+        self.max_span_width = max_span_width
+        self.use_span_width_embedding = use_span_width_embedding
+        self.linear_size = linear_size
+        self.start_loss_weight = start_loss_weight
+        self.end_loss_weight = end_loss_weight
+        self.span_loss_weight = span_loss_weight
+        super().__init__(**kwargs)

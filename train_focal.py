@@ -6,24 +6,24 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional
 
-import numpy as np
 import datasets
-from datasets import Dataset, load_dataset
+from datasets import load_dataset, Dataset, DatasetDict, concatenate_datasets
 
 import transformers
 from transformers import (
     AutoTokenizer,
     HfArgumentParser,
-    PreTrainedTokenizerFast,
     TrainingArguments,
+    EarlyStoppingCallback,
     set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint
 
-from src.model import Binder, BinderDecoder
-from src.trainer import BinderDataCollator, BinderTrainer
+from src.config import BinderFocalConfig
+from src.model import BinderFocalModel
+from src.trainer import BinderFocalDataCollator, BinderTrainer
 from src import utils as postprocess_utils
 
 
@@ -35,39 +35,35 @@ class ModelArguments:
     """
     Arguments for Binder.
     """
-
-    model_name_or_path: str = field(
+    model_class: str = field(
+        metadata={"help": "Model class to use."}
+    )
+    text_encoder: str = field(
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
-    config_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
+    type_encoder: str = field(
+        default=None, metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
-    tokenizer_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
+    text_tokenizer: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as text_encoder"}
     )
-    cache_dir: Optional[str] = field(
-        default=None,
-        metadata={"help": "Path to directory to store the pretrained models downloaded from huggingface.co"},
+    type_tokenizer: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as type_encoder"}
     )
-    model_revision: str = field(
-        default="main",
-        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
+    text_config: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained config name or path if not the same as text_encoder"}
     )
-    use_auth_token: bool = field(
-        default=False,
-        metadata={
-            "help": "Will use the token generated when running `transformers-cli login` (necessary to use this script "
-            "with private models)."
-        },
+    type_config: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained config name or path if not the same as type_encoder"}
     )
-    hidden_dropout_prob: float = field(
+    dropout: float = field(
         default=0.1, metadata={"help": "Dropout rate for hidden states."}
     )
     use_span_width_embedding: bool = field(
-        default=False, metadata={"help": "Use span width embeddings."}
+        default=True, metadata={"help": "Use span width embeddings."}
     )
     linear_size: int = field(
-        default=128, metadata={"help": "Size of the last linear layer."}
+        default=384, metadata={"help": "Size of the last linear layer."}
     )
     init_temperature: float = field(
         default=0.07, metadata={"help": "Init value of temperature used in contrastive loss."}
@@ -81,26 +77,12 @@ class ModelArguments:
     span_loss_weight: float = field(
         default=0.6, metadata={"help": "NER span loss weight."}
     )
-    threshold_loss_weight: float = field(
-        default=0.5, metadata={"help": "NER threshold loss weight."}
-    )
-    ner_loss_weight: float = field(
-        default=0.5, metadata={"help": "NER loss weight."}
-    )
-
 
 @dataclass
 class DataTrainingArguments:
     """
     Arguments pertaining to what data we are going to input our model for training and eval.
     """
-
-    dataset_name: str = field(
-        metadata={"help": "The name of the dataset to use, from which it will decide entity types to use."}
-    )
-    dataset_config_name: Optional[str] = field(
-        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
-    )
     train_file: Optional[str] = field(default=None, metadata={"help": "The input training data file (a text file)."})
     validation_file: Optional[str] = field(
         default=None,
@@ -154,7 +136,7 @@ class DataTrainingArguments:
         },
     )
     doc_stride: int = field(
-        default=128,
+        default=16,
         metadata={"help": "When splitting up a long document into chunks, how much stride to take between chunks."},
     )
     max_span_length: int = field(
@@ -162,22 +144,6 @@ class DataTrainingArguments:
         metadata={
             "help": "The maximum length of an entity span."
         },
-    )
-    entity_type_file: str = field(
-        default=None,
-        metadata={"help": "The entity type file contains all entity type names, descriptions, etc."},
-    )
-    dataset_entity_types: Optional[List[str]] = field(
-        default_factory=list,
-        metadata={"help": "The entity types of this dataset, which are only a part of types in the entity type file."},
-    )
-    entity_type_key_field: Optional[str] = field(
-        default="name",
-        metadata={"help": "The field in the entity type file that will be used as key to sort entity types."},
-    )
-    entity_type_desc_field: Optional[str] = field(
-        default="description",
-        metadata={"help": "The field in the entity type file that corresponds to entity descriptions."},
     )
     prediction_postprocess_func: Optional[str] = field(
         default="postprocess_nested_predictions",
@@ -188,12 +154,7 @@ class DataTrainingArguments:
         metadata={"help": "The name of WANDB project."},
     )
 
-
 def main():
-    # See all possible arguments in src/transformers/training_args.py
-    # or by passing the --help flag to this script.
-    # We now keep distinct sets of args, for a cleaner separation of concerns.
-
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if sys.argv[-1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
@@ -203,6 +164,8 @@ def main():
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     # Setup env variables and logging
+    os.environ["WANDB_PROJECT"] = "binder"
+    os.environ["WANDB_DIR"] = training_args.output_dir
     os.makedirs(training_args.output_dir, exist_ok=True)
     log_file_handler = logging.FileHandler(os.path.join(training_args.output_dir, "run.log"), "a")
     logging.basicConfig(
@@ -243,52 +206,74 @@ def main():
 
     set_seed(training_args.seed)
 
-    data_files = {d.split('.')[0]: os.path.join(data_args.test_file, d) for d in os.listdir(data_args.test_file)}
-    if 'conll2003' in data_args.test_file:
-        evaluation_datasets[language] = load_dataset(
-            "json", 
-            data_files={'test': os.path.join(data_args.test_file, language, 'test.json')}, 
-            cache_dir=model_args.cache_dir, split='test'
-        )
+    if isinstance(data_args.train_file, str) and data_args.train_file.endswith(".json"):
+        data_files = {}
+        if data_args.train_file is not None:
+            extension = data_args.train_file.split(".")[-1]
+            data_files["train"] = data_args.train_file
+        if data_args.validation_file is not None:
+            data_files["validation"] = data_args.validation_file
+            extension = data_args.validation_file.split(".")[-1]
+        raw_datasets = load_dataset(extension, data_files=data_files, cache_dir=model_args.cache_dir)
     else:
-        # dictionary mapping language code to json file and load with HF json loader
-        evaluation_datasets = load_dataset("json", data_files=data_files, cache_dir=model_args.cache_dir)
+        data_files = {}
+        for dataset_name in data_args.train_file:
+            model_name = model_args.text_encoder.split("/")[-1]
+            data_files[dataset_name] = Dataset.load_from_disk(f"/vol/tmp/goldejon/multilingual_ner/binder/data/training/tokenized/{model_name}/{dataset_name}")
+        train_dataset = concatenate_datasets(data_files.values())
+        raw_datasets = DatasetDict({"train": train_dataset})
+
+    if training_args.do_train:
+        if "train" not in raw_datasets:
+            raise ValueError("--do_train requires a train dataset")
+        if data_args.max_train_samples is None and 'train' not in raw_datasets:
+            raise ValueError("max_train_samples is required when train file is not provided")
+        
+        train_samples = len(raw_datasets["train"]) if data_args.max_train_samples is None else data_args.max_train_samples
+        
+        if "validation" not in raw_datasets and training_args.do_eval and data_args.max_eval_samples is not None:
+            train_samples += data_args.max_eval_samples
+        if "test" not in raw_datasets and training_args.do_predict and data_args.max_predict_samples is not None:
+            train_samples += data_args.max_predict_samples
+
+        train_samples = min(train_samples, len(raw_datasets["train"]))
+        raw_datasets["train"] = raw_datasets["train"].select(range(train_samples))
+
+    if training_args.do_eval and "validation" not in raw_datasets:
+        if data_args.max_eval_samples is None:
+            raise ValueError("max_eval_samples is required when validation file is not provided")
+
+        train_valid_split = raw_datasets["train"].train_test_split(test_size=data_args.max_eval_samples)
+        raw_datasets["train"] = train_valid_split["train"]
+        raw_datasets["validation"] = train_valid_split["test"]
 
     id2label = {}
-    for language in evaluation_datasets.keys():
-        test_labels = set([label for labels in evaluation_datasets[language]['entity_types'] for label in labels])
-        id2label[language] = {'predict': {i: label for i, label in enumerate(test_labels)}}
+    if training_args.do_eval and "validation" in raw_datasets:
+        dev_labels = set([label["type"] for labels in raw_datasets["validation"]['ner'] for label in labels])
+        id2label['eval'] = {i: label for i, label in enumerate(dev_labels)}
 
     tokenizer = AutoTokenizer.from_pretrained(
-        model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+        model_args.text_tokenizer if model_args.text_tokenizer else model_args.text_encoder,
         cache_dir=model_args.cache_dir,
         use_fast=True,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
         add_prefix_space=True,
     )
+    
+    config = BinderFocalConfig(
+        text_encoder=model_args.config_name if model_args.config_name else model_args.text_encoder,
+        type_encoder=model_args.type_encoder if model_args.type_encoder else model_args.type_encoder,
+        dropout=model_args.dropout,
+        max_span_width=data_args.max_seq_length + 1,
+        use_span_width_embedding=model_args.use_span_width_embedding,
+        linear_size=model_args.linear_size,
+        start_loss_weight=model_args.start_loss_weight,
+        end_loss_weight=model_args.end_loss_weight,
+        span_loss_weight=model_args.span_loss_weight,
+    )
+    model = BinderFocalModel(config)
 
-    if "gemma" in model_args.model_name_or_path:
-        model = BinderDecoder.from_pretrained(model_args.model_name_or_path)
-    else:
-        model = Binder.from_pretrained(model_args.model_name_or_path)
-   
-    # Tokenizer check: this script requires a fast tokenizer.
-    if not isinstance(tokenizer, PreTrainedTokenizerFast):
-        raise ValueError(
-            "This example script only works for models that have a fast tokenizer. Checkout the big table of models "
-            "at https://huggingface.co/transformers/index.html#supported-frameworks to find the model types that meet this "
-            "requirement"
-        )
-
-    if data_args.max_seq_length > tokenizer.model_max_length:
-        logger.warning(
-            f"The max_seq_length passed ({data_args.max_seq_length}) is larger than the maximum length for the"
-            f"model ({tokenizer.model_max_length}). Using max_seq_length={tokenizer.model_max_length}."
-        )
-    max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
-
-    # Validation preprocessing
     def prepare_validation_features(examples, split: str = "eval"):
         # Tokenize our examples with truncation and maybe padding, but keep the overflows using a stride. This results
         # in one example possible giving several features when a context is long, each of those features having a
@@ -296,7 +281,7 @@ def main():
         tokenized_examples = tokenizer(
             examples["text"],
             truncation=True,
-            max_length=max_seq_length,
+            max_length=data_args.max_seq_length,
             stride=data_args.doc_stride,
             return_overflowing_tokens=True,
             return_offsets_mapping=True,
@@ -349,69 +334,90 @@ def main():
 
         return tokenized_examples
 
-    # Prediction
-    if training_args.do_predict:
-        for language in evaluation_datasets.keys():
-            # Data collator
-            data_collator = BinderDataCollator(tokenizer=tokenizer, id2label=id2label[language])
-
-            if training_args.should_save:
-                os.makedirs(training_args.output_dir, exist_ok=True)
-
-            if os.path.exists(training_args.output_dir + '/' + language):
-                continue
-
-            # Post-processing:
-            def post_processing_function(examples, features, predictions, stage=f"eval"):
-                # Post-processing: we match the start logits and end logits to answers in the original context.
-                metrics = getattr(postprocess_utils, data_args.prediction_postprocess_func)(
-                    examples=examples,
-                    features=features,
-                    predictions=predictions,
-                    id_to_type=id2label[language][stage],
-                    max_span_length=data_args.max_span_length,
-                    output_dir=training_args.output_dir if training_args.should_save else None,
-                    log_level=log_level,
-                    prefix=language,
-                    tokenizer=tokenizer,
-                    train_file=data_args.train_file,
-                )
-
-                return metrics
-
-            # Initialize our Trainer
-            trainer = BinderTrainer(
-                model=model,
-                args=training_args,
-                tokenizer=tokenizer,
-                data_collator=data_collator,
-                post_process_function=post_processing_function,
-                compute_metrics=None,
+    if training_args.do_eval and "input_ids" not in raw_datasets["validation"].column_names:
+        if "validation" not in raw_datasets:
+            raise ValueError("--do_eval requires a validation dataset")
+        eval_examples = raw_datasets["validation"]
+        if data_args.max_eval_samples is not None:
+            # We will select sample from whole data
+            eval_examples = eval_examples.select(range(data_args.max_eval_samples))
+        # Validation Feature Creation
+        with training_args.main_process_first(desc="validation dataset map pre-processing"):
+            eval_dataset = eval_examples.map(
+                prepare_validation_features,
+                batched=True,
+                num_proc=data_args.preprocessing_num_workers,
+                remove_columns=raw_datasets["validation"].column_names,
+                load_from_cache_file=not data_args.overwrite_cache,
+                desc="Running tokenizer on validation dataset",
             )
 
-            predict_examples = evaluation_datasets[language]
-            # Predict Feature Creation
-            with training_args.main_process_first(desc="prediction dataset map pre-processing"):
-                predict_dataset = predict_examples.map(
-                    lambda x: prepare_validation_features(x, "predict"),
-                    batched=True,
-                    num_proc=data_args.preprocessing_num_workers,
-                    remove_columns=evaluation_datasets[language].column_names,
-                    load_from_cache_file=not data_args.overwrite_cache,
-                    desc="Running tokenizer on prediction dataset",
-                )
+    # Data collator
+    data_collator = BinderFocalDataCollator(tokenizer=tokenizer, id2label=id2label)
 
-            logger.info("*** Predict ***")
-            results = trainer.predict(predict_dataset, predict_examples)
-            metrics = results.metrics
+    # Post-processing:
+    def post_processing_function(examples, features, predictions, stage=f"eval"):
+        # Post-processing: we match the start logits and end logits to answers in the original context.
+        metrics = getattr(postprocess_utils, data_args.prediction_postprocess_func)(
+            examples=examples,
+            features=features,
+            predictions=predictions,
+            id_to_type=id2label[stage],
+            max_span_length=data_args.max_span_length,
+            output_dir=training_args.output_dir if training_args.should_save else None,
+            log_level=log_level,
+            prefix=stage,
+            tokenizer=tokenizer,
+            train_file=data_args.train_file,
+        )
 
-            max_predict_samples = (
-                data_args.max_predict_samples if data_args.max_predict_samples is not None else len(predict_dataset)
-            )
-            metrics["predict_samples"] = min(max_predict_samples, len(predict_dataset))
+        return metrics
 
-            trainer.log_metrics(language, metrics)
-            trainer.save_metrics(language, metrics)
+    # Initialize our Trainer
+    trainer = BinderTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset if training_args.do_train else None,
+        eval_dataset=eval_dataset if training_args.do_eval else None,
+        eval_examples=eval_examples if training_args.do_eval else None,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=20)] if training_args.do_eval else None,
+        post_process_function=post_processing_function,
+        compute_metrics=None,
+    )
+
+    # Training
+    if training_args.do_train:
+        checkpoint = None
+        if training_args.resume_from_checkpoint is not None:
+            checkpoint = training_args.resume_from_checkpoint
+        elif last_checkpoint is not None:
+            checkpoint = last_checkpoint
+        # with profiler_callback.profiler:
+        train_result = trainer.train(resume_from_checkpoint=checkpoint)
+        trainer.save_model()  # Saves the tokenizer too for easy upload
+
+        metrics = train_result.metrics
+        max_train_samples = (
+            data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
+        )
+        metrics["train_samples"] = min(max_train_samples, len(train_dataset))
+
+        trainer.log_metrics("train", metrics)
+        trainer.save_metrics("train", metrics)
+        trainer.save_state()
+
+    # Evaluation
+    if training_args.do_eval:
+        logger.info("*** Evaluate ***")
+        metrics = trainer.evaluate()
+
+        max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
+        metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
+
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
 
     kwargs = {"finetuned_from": model_args.model_name_or_path, "model_name": "Binder"}
     if data_args.dataset_name is not None:
@@ -421,6 +427,12 @@ def main():
             kwargs["dataset"] = f"{data_args.dataset_name} {data_args.dataset_config_name}"
         else:
             kwargs["dataset"] = data_args.dataset_name
+
+    if training_args.push_to_hub:
+        trainer.push_to_hub(**kwargs)
+    else:
+        trainer.create_model_card(**kwargs)
+
 
 def _mp_fn(index):
     # For xla_spawn (TPUs)

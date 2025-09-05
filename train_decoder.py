@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List
 
 import datasets
-from datasets import load_dataset
+from datasets import load_dataset, Dataset, DatasetDict, concatenate_datasets
 
 import transformers
 from transformers import (
@@ -23,7 +23,7 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint
 
 from src.config import BinderConfig
-from src.model import Binder
+from src.model import Binder, BinderDecoder
 from src.trainer import BinderDataCollator, BinderTrainer
 from src import utils as postprocess_utils
 
@@ -189,26 +189,6 @@ class DataTrainingArguments:
         metadata={"help": "The name of WANDB project."},
     )
 
-    def __post_init__(self):
-        if (
-            self.dataset_name is None
-            and self.train_file is None
-            and self.validation_file is None
-            and self.test_file is None
-        ):
-            raise ValueError("Need either a dataset name or a training/validation file/test_file.")
-        else:
-            if self.train_file is not None:
-                extension = self.train_file.split(".")[-1]
-                assert extension == "json", "`train_file` should be a json file."
-            if self.validation_file is not None:
-                extension = self.validation_file.split(".")[-1]
-                assert extension == "json", "`validation_file` should be a json file."
-            if self.test_file is not None:
-                extension = self.test_file.split(".")[-1]
-                assert extension == "json", "`test_file` should be a json file."
-
-
 def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
@@ -265,14 +245,22 @@ def main():
 
     set_seed(training_args.seed)
 
-    data_files = {}
-    if data_args.train_file is not None:
-        data_files["train"] = data_args.train_file
-        extension = data_args.train_file.split(".")[-1]
-    if data_args.validation_file is not None:
-        data_files["validation"] = data_args.validation_file
-        extension = data_args.validation_file.split(".")[-1]
-    raw_datasets = load_dataset(extension, data_files=data_files, cache_dir=model_args.cache_dir)
+    if isinstance(data_args.train_file, str) and data_args.train_file.endswith(".json"):
+        data_files = {}
+        if data_args.train_file is not None:
+            extension = data_args.train_file.split(".")[-1]
+            data_files["train"] = data_args.train_file
+        if data_args.validation_file is not None:
+            data_files["validation"] = data_args.validation_file
+            extension = data_args.validation_file.split(".")[-1]
+        raw_datasets = load_dataset(extension, data_files=data_files, cache_dir=model_args.cache_dir)
+    else:
+        data_files = {}
+        for dataset_name in data_args.train_file:
+            model_name = model_args.model_name_or_path.split("/")[-1]
+            data_files[dataset_name] = Dataset.load_from_disk(f"/vol/tmp/goldejon/multilingual_ner/binder/data/training/tokenized/{model_name}/{dataset_name}")
+        train_dataset = concatenate_datasets(data_files.values())
+        raw_datasets = DatasetDict({"train": train_dataset})
 
     if training_args.do_train:
         if "train" not in raw_datasets:
@@ -333,7 +321,10 @@ def main():
         threshold_loss_weight=model_args.threshold_loss_weight,
         ner_loss_weight=model_args.ner_loss_weight,
     )
-    model = Binder(config)
+    if model_args.model_name_or_path == "google/gemma-3-270M":
+        model = BinderDecoder(config)
+    else:
+        model = Binder(config)
 
     # Tokenizer check: this script requires a fast tokenizer.
     if not isinstance(tokenizer, PreTrainedTokenizerFast):
@@ -480,8 +471,7 @@ def main():
 
         return processed_examples
 
-    if training_args.do_train:
-
+    if training_args.do_train and "input_ids" not in raw_datasets["train"].column_names:
         if "train" not in raw_datasets:
             raise ValueError("--do_train requires a train dataset")
         train_dataset = raw_datasets["train"]
@@ -560,7 +550,7 @@ def main():
 
         return tokenized_examples
 
-    if training_args.do_eval:
+    if training_args.do_eval and "input_ids" not in raw_datasets["validation"].column_names:
         if "validation" not in raw_datasets:
             raise ValueError("--do_eval requires a validation dataset")
         eval_examples = raw_datasets["validation"]

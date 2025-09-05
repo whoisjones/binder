@@ -20,6 +20,14 @@ class Annotation:
     end_char: int
     text: str
 
+@dataclass
+class Span:
+    type_id: int
+    start: int
+    end: int
+    start_mask: List[int]
+    end_mask: List[int]
+    span_mask: List[int]
 
 def compute_tp_fn_fp(predictions: Set, labels: Set, **kwargs) -> Dict[str, float]:
     # tp, fn, fp
@@ -539,6 +547,9 @@ def postprocess_flat_predictions(
             example = copy.deepcopy(example)
             example.pop("word_start_chars")
             example.pop("word_end_chars")
+            if "ner_tags_idx" in example:
+                example.pop("ner_tags_idx")
+                example.pop("ner_tags_str")
             gold_ner = set()
             for entity_type, start_char, end_char in zip(
                 example["entity_types"], example["entity_start_chars"], example["entity_end_chars"]):

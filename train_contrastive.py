@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List
 
 import datasets
-from datasets import load_dataset
+from datasets import load_dataset, Dataset, DatasetDict, concatenate_datasets
 
 import transformers
 from transformers import (
@@ -22,9 +22,9 @@ from transformers import (
 )
 from transformers.trainer_utils import get_last_checkpoint
 
-from src.config_original import BinderConfig
-from src.model_original import Binder
-from src.trainer_original import BinderDataCollator, BinderTrainer
+from src.config import BinderConfig
+from src.model import Binder, BinderDecoder
+from src.trainer import BinderDataCollator, BinderTrainer
 from src import utils as postprocess_utils
 
 
@@ -189,26 +189,6 @@ class DataTrainingArguments:
         metadata={"help": "The name of WANDB project."},
     )
 
-    def __post_init__(self):
-        if (
-            self.dataset_name is None
-            and self.train_file is None
-            and self.validation_file is None
-            and self.test_file is None
-        ):
-            raise ValueError("Need either a dataset name or a training/validation file/test_file.")
-        else:
-            if self.train_file is not None:
-                extension = self.train_file.split(".")[-1]
-                assert extension == "json", "`train_file` should be a json file."
-            if self.validation_file is not None:
-                extension = self.validation_file.split(".")[-1]
-                assert extension == "json", "`validation_file` should be a json file."
-            if self.test_file is not None:
-                extension = self.test_file.split(".")[-1]
-                assert extension == "json", "`test_file` should be a json file."
-
-
 def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
@@ -263,39 +243,59 @@ def main():
                 "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
             )
 
-    # Set seed before initializing model.
     set_seed(training_args.seed)
 
-    # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
-    # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
-    # (the dataset will be downloaded automatically from the datasets Hub).
-    #
-    # For CSV/JSON files, this script will use the column called 'text' or the first column if no column called
-    # 'text' is found. You can easily tweak this behavior (see below).
-    #
-    # In distributed training, the load_dataset function guarantee that only one local process can concurrently
-    # download the dataset.
-    data_files = {}
-    if data_args.train_file is not None:
-        data_files["train"] = data_args.train_file
-        extension = data_args.train_file.split(".")[-1]
+    if isinstance(data_args.train_file, str) and data_args.train_file.endswith(".json"):
+        data_files = {}
+        if data_args.train_file is not None:
+            extension = data_args.train_file.split(".")[-1]
+            data_files["train"] = data_args.train_file
+        if data_args.validation_file is not None:
+            data_files["validation"] = data_args.validation_file
+            extension = data_args.validation_file.split(".")[-1]
+        raw_datasets = load_dataset(extension, data_files=data_files, cache_dir=model_args.cache_dir)
+    else:
+        data_files = {}
+        for dataset_name in data_args.train_file:
+            model_name = model_args.model_name_or_path.split("/")[-1]
+            data_files[dataset_name] = Dataset.load_from_disk(f"/vol/tmp/goldejon/multilingual_ner/binder/data/training/tokenized/{model_name}/{dataset_name}")
+        train_dataset = concatenate_datasets(data_files.values())
+        raw_datasets = DatasetDict({"train": train_dataset})
 
-    if data_args.validation_file is not None:
-        data_files["validation"] = data_args.validation_file
-        extension = data_args.validation_file.split(".")[-1]
-    if data_args.test_file is not None:
-        data_files["test"] = data_args.test_file
-        extension = data_args.test_file.split(".")[-1]
-    raw_datasets = load_dataset(extension, data_files=data_files, cache_dir=model_args.cache_dir)
-    raw_datasets['train'] = raw_datasets['train'].select(range(2))
-    # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
-    # https://huggingface.co/docs/datasets/loading_datasets.html.
+    if training_args.do_train:
+        if "train" not in raw_datasets:
+            raise ValueError("--do_train requires a train dataset")
+        if data_args.max_train_samples is None and 'train' not in raw_datasets:
+            raise ValueError("max_train_samples is required when train file is not provided")
+        train_samples = len(raw_datasets["train"]) if data_args.max_train_samples is None else data_args.max_train_samples
+        if "validation" not in raw_datasets and training_args.do_eval and data_args.max_eval_samples is not None:
+            train_samples += data_args.max_eval_samples
+        if "test" not in raw_datasets and training_args.do_predict and data_args.max_predict_samples is not None:
+            train_samples += data_args.max_predict_samples
+        raw_datasets["train"] = raw_datasets["train"].select(range(train_samples))
+    if training_args.do_eval and "validation" not in raw_datasets:
+        if data_args.max_eval_samples is None:
+            raise ValueError("max_eval_samples is required when validation file is not provided")
+        train_valid_split = raw_datasets["train"].train_test_split(test_size=data_args.max_eval_samples)
+        raw_datasets["train"] = train_valid_split["train"]
+        raw_datasets["validation"] = train_valid_split["test"]
 
-    # Load pretrained model and tokenizer
-    #
-    # Distributed training:
-    # The .from_pretrained methods guarantee that only one local process can concurrently
-    # download model & vocab.
+    if 'train' in raw_datasets and 'id' not in raw_datasets["train"].column_names:
+        raw_datasets["train"] = raw_datasets["train"].add_column(
+            name="id",
+            column=[f"train_{i}" for i in range(len(raw_datasets["train"]))]
+        )
+    if 'validation' in raw_datasets and 'id' not in raw_datasets["validation"].column_names:
+        raw_datasets["validation"] = raw_datasets["validation"].add_column(
+            name="id",
+            column=[f"eval_{i}" for i in range(len(raw_datasets["validation"]))]
+        )
+
+    id2label = {}
+    if training_args.do_eval and "validation" in raw_datasets:
+        dev_labels = set([label for labels in raw_datasets["validation"]['entity_types'] for label in labels])
+        id2label['eval'] = {i: label for i, label in enumerate(dev_labels)}
+
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
@@ -304,7 +304,7 @@ def main():
         use_auth_token=True if model_args.use_auth_token else None,
         add_prefix_space=True,
     )
-    logger.info("===== Init the model =====")
+    
     config = BinderConfig(
         pretrained_model_name_or_path=model_args.config_name if model_args.config_name else model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
@@ -321,7 +321,10 @@ def main():
         threshold_loss_weight=model_args.threshold_loss_weight,
         ner_loss_weight=model_args.ner_loss_weight,
     )
-    model = Binder(config)
+    if model_args.model_name_or_path == "google/gemma-3-270M":
+        model = BinderDecoder(config)
+    else:
+        model = Binder(config)
 
     # Tokenizer check: this script requires a fast tokenizer.
     if not isinstance(tokenizer, PreTrainedTokenizerFast):
@@ -338,41 +341,6 @@ def main():
         )
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
 
-    # Load entity type knowledge
-    entity_type_knowledge = load_dataset(
-        "json", data_files=data_args.entity_type_file, cache_dir=model_args.cache_dir
-    )["train"]
-    entity_type_knowledge = entity_type_knowledge.filter(
-        lambda example: (
-            example["dataset"] == data_args.dataset_name and (
-                len(data_args.dataset_entity_types) == 0 or
-                example[data_args.entity_type_key_field] in data_args.dataset_entity_types
-            )
-        )
-    )
-    entity_type_knowledge = entity_type_knowledge.sort(data_args.entity_type_key_field)
-
-    entity_type_id_to_str = [et[data_args.entity_type_key_field] for et in entity_type_knowledge]
-    entity_type_str_to_id = {t: i for i, t in enumerate(entity_type_id_to_str)}
-
-    def prepare_type_features(examples):
-        tokenized_examples = tokenizer(
-            examples[data_args.entity_type_desc_field],
-            truncation=True,
-            max_length=max_seq_length,
-            padding="longest" if len(entity_type_knowledge) <= 1000 else "max_length",
-        )
-        return tokenized_examples
-
-    with training_args.main_process_first(desc="Tokenizing entity type descriptions"):
-        tokenized_descriptions = entity_type_knowledge.map(
-            prepare_type_features,
-            batched=True,
-            load_from_cache_file=not data_args.overwrite_cache,
-            desc="Running tokenizer on type descriptions",
-            remove_columns=entity_type_knowledge.column_names,
-        )
-
     # Preprocessing the datasets.
     # Preprocessing is slightly different for training and evaluation.
     if training_args.do_train and "train" in raw_datasets:
@@ -380,7 +348,7 @@ def main():
     elif training_args.do_eval:
         column_names = raw_datasets["validation"].column_names
     else:
-        column_names = raw_datasets["test"].column_names
+        raise ValueError("No dataset provided")
 
     # Training preprocessing
     def prepare_train_features(examples):
@@ -410,6 +378,9 @@ def main():
             "attention_mask": [],
             "token_start_mask": [],
             "token_end_mask": [],
+            "default_span_mask": [],
+            "split": [],
+            "example_id": [],
             "ner": [],
         }
         # RoBERTa doesn't need token_type_ids.
@@ -449,6 +420,7 @@ def main():
                     token_start_mask.append(int(start_char in word_start_chars))
                     token_end_mask.append(int(end_char in word_end_chars))
 
+            # Subword span mask: 1 if the span is in the text, 0 otherwise.
             default_span_mask = [
                 [
                     (j - i >= 0) * s * e for j, e in enumerate(token_end_mask)
@@ -456,16 +428,11 @@ def main():
                 for i, s in enumerate(token_start_mask)
             ]
 
-            start_negative_mask = [token_start_mask[:] for _ in entity_type_id_to_str]
-            end_negative_mask = [token_end_mask[:] for _ in entity_type_id_to_str]
-            span_negative_mask = [[x[:] for x in default_span_mask] for _ in entity_type_id_to_str]
-
-            # We convert NER into a list of (type_id, start_index, end_index) tuples.
-            tokenized_ner_annotations = []
-
+            annotations = []
             entity_types = examples["entity_types"][sample_index]
             entity_start_chars = examples["entity_start_chars"][sample_index]
             entity_end_chars = examples["entity_end_chars"][sample_index]
+
             assert len(entity_types) == len(entity_start_chars) == len(entity_end_chars)
             for entity_type, start_char, end_char in zip(entity_types, entity_start_chars, entity_end_chars):
                 # Detect if the span is in the text.
@@ -481,22 +448,14 @@ def main():
                         end_token_index -= 1
                     end_token_index += 1
 
-                    entity_type_id = entity_type_str_to_id[entity_type]
-
                     # Inclusive start and end.
-                    tokenized_ner_annotations.append({
-                        "type_id": entity_type_id,
+                    annotations.append({
+                        "type": entity_type,
                         "start": start_token_index,
                         "end": end_token_index,
                     })
 
-                    # Exclude the start/end of the NER span.
-                    start_negative_mask[entity_type_id][start_token_index] = 0
-                    end_negative_mask[entity_type_id][end_token_index] = 0
-                    span_negative_mask[entity_type_id][start_token_index][end_token_index] = 0
-
-            # Skip training examples without annotations.
-            if len(tokenized_ner_annotations) == 0:
+            if len(annotations) == 0:
                 continue
 
             processed_examples["input_ids"].append(input_ids)
@@ -505,21 +464,14 @@ def main():
             processed_examples["attention_mask"].append(tokenized_examples["attention_mask"][i])
             processed_examples["token_start_mask"].append(token_start_mask)
             processed_examples["token_end_mask"].append(token_end_mask)
-
-            processed_examples["ner"].append({
-                "annotations": tokenized_ner_annotations,
-                "start_negative_mask": start_negative_mask,
-                "end_negative_mask": end_negative_mask,
-                "span_negative_mask": span_negative_mask,
-                "token_start_mask": token_start_mask,
-                "token_end_mask": token_end_mask,
-                "default_span_mask": default_span_mask,
-            })
+            processed_examples["default_span_mask"].append(default_span_mask)
+            processed_examples['ner'].append(annotations)
+            processed_examples["split"].append("train")
+            processed_examples["example_id"].append(examples["id"][sample_index])
 
         return processed_examples
 
-    if training_args.do_train:
-
+    if training_args.do_train and "input_ids" not in raw_datasets["train"].column_names:
         if "train" not in raw_datasets:
             raise ValueError("--do_train requires a train dataset")
         train_dataset = raw_datasets["train"]
@@ -538,7 +490,7 @@ def main():
             )
 
     # Validation preprocessing
-    def prepare_validation_features(examples, split: str = "dev"):
+    def prepare_validation_features(examples, split: str = "eval"):
         # Tokenize our examples with truncation and maybe padding, but keep the overflows using a stride. This results
         # in one example possible giving several features when a context is long, each of those features having a
         # context that overlaps a bit the context of the previous feature.
@@ -598,7 +550,7 @@ def main():
 
         return tokenized_examples
 
-    if training_args.do_eval:
+    if training_args.do_eval and "input_ids" not in raw_datasets["validation"].column_names:
         if "validation" not in raw_datasets:
             raise ValueError("--do_eval requires a validation dataset")
         eval_examples = raw_datasets["validation"]
@@ -616,30 +568,8 @@ def main():
                 desc="Running tokenizer on validation dataset",
             )
 
-    if training_args.do_predict:
-        if "test" not in raw_datasets:
-            raise ValueError("--do_predict requires a test dataset")
-        predict_examples = raw_datasets["test"]
-        if data_args.max_predict_samples is not None:
-            # We will select sample from whole data
-            predict_examples = predict_examples.select(range(data_args.max_predict_samples))
-        # Predict Feature Creation
-        with training_args.main_process_first(desc="prediction dataset map pre-processing"):
-            predict_dataset = predict_examples.map(
-                lambda x: prepare_validation_features(x, "test"),
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                remove_columns=column_names,
-                load_from_cache_file=not data_args.overwrite_cache,
-                desc="Running tokenizer on prediction dataset",
-            )
-
     # Data collator
-    data_collator = BinderDataCollator(
-        type_input_ids=tokenized_descriptions["input_ids"],
-        type_attention_mask=tokenized_descriptions["attention_mask"],
-        type_token_type_ids=tokenized_descriptions["token_type_ids"] if "token_type_ids" in tokenized_descriptions else None,
-    )
+    data_collator = BinderDataCollator(tokenizer=tokenizer, id2label=id2label)
 
     # Post-processing:
     def post_processing_function(examples, features, predictions, stage=f"eval"):
@@ -648,7 +578,7 @@ def main():
             examples=examples,
             features=features,
             predictions=predictions,
-            id_to_type=entity_type_id_to_str,
+            id_to_type=id2label[stage],
             max_span_length=data_args.max_span_length,
             output_dir=training_args.output_dir if training_args.should_save else None,
             log_level=log_level,
@@ -668,7 +598,7 @@ def main():
         eval_examples=eval_examples if training_args.do_eval else None,
         tokenizer=tokenizer,
         data_collator=data_collator,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=20)],
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=20)] if training_args.do_eval else None,
         post_process_function=post_processing_function,
         compute_metrics=None,
     )
@@ -704,20 +634,6 @@ def main():
 
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
-
-    # Prediction
-    if training_args.do_predict:
-        logger.info("*** Predict ***")
-        results = trainer.predict(predict_dataset, predict_examples)
-        metrics = results.metrics
-
-        max_predict_samples = (
-            data_args.max_predict_samples if data_args.max_predict_samples is not None else len(predict_dataset)
-        )
-        metrics["predict_samples"] = min(max_predict_samples, len(predict_dataset))
-
-        trainer.log_metrics("predict", metrics)
-        trainer.save_metrics("predict", metrics)
 
     kwargs = {"finetuned_from": model_args.model_name_or_path, "model_name": "Binder"}
     if data_args.dataset_name is not None:

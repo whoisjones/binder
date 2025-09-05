@@ -1,7 +1,7 @@
 {
     "run_name": "evaluation-panx",
     "dataset_name": "PAN-X",
-    "model_name_or_path": "/vol/tmp/goldejon/multilingual_ner/binder/models/conll03-debug-train",
+    "model_name_or_path": "/vol/tmp/goldejon/multilingual_ner/binder/models/baseline/xlm-roberta-base",
     "test_file": "/vol/tmp/goldejon/multilingual_ner/binder/data/evaluation/multiconer_v2",
     "entity_type_file": null,
     "dataset_entity_types": null,
@@ -19,7 +19,6 @@
     "gradient_checkpointing": false,
     "optim": "adamw_torch",
     "label_names": ["ner"],
-    "max_steps": 300,
     "per_device_train_batch_size": 2,
     "per_device_eval_batch_size": 2,
     "gradient_accumulation_steps": 1,
@@ -34,6 +33,6 @@
     "do_eval": false,
     "eval_strategy": "no",
     "do_predict": true,
-    "output_dir": "/vol/tmp/goldejon/multilingual_ner/binder/evaluations/panx",
+    "output_dir": "/vol/tmp/goldejon/multilingual_ner/binder/evaluations/baseline/xlm-roberta-base/multiconer_v2",
     "remove_unused_columns": false
 }
