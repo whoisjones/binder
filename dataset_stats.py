@@ -16,11 +16,12 @@ MAX_EVAL_SAMPLES_PER_DATASET = {
 }
 
 def process_single_split(dataset):
+    column = "spans_char" if "spans_char" in dataset.column_names else "char_spans"
     df = dataset.to_pandas()
     avg_text_length = df['text'].apply(len).mean()
-    avg_annotations_per_sentence = df['spans_char'].apply(len).mean()
-    avg_distinct_annotations_per_sentence = df['spans_char'].apply(lambda x: len(set([span['tag'] for span in x]))).mean()
-    distinct_entity_types = set(tag for tags in df['spans_char'].apply(lambda x: [span['tag'] for span in x]) for tag in tags)
+    avg_annotations_per_sentence = df[column].apply(len).mean()
+    avg_distinct_annotations_per_sentence = df[column].apply(lambda x: len(set([span['tag'] for span in x]))).mean()
+    distinct_entity_types = set(tag for tags in df[column].apply(lambda x: [span['tag'] for span in x]) for tag in tags)
     num_distinct_entity_types = len(distinct_entity_types)
     return {
         'num_sentences': len(df),
@@ -51,14 +52,24 @@ def process_dataset_dict(dataset_dict):
     dataset_stats = pd.concat([dataset_stats, pd.DataFrame([compute_average(dataset_stats)])])
     return dataset_stats
 
+import json
+import glob
+
 def compute_train():
     path = "/vol/tmp/goldejon/multilingual_ner/data/training_jsonl"
+    path_tmp2 = "/vol/tmp2/goldejon/multilingual_ner/data/"
     dataset_stats = []
-    for training_dataset in ["nuner", "pilener", "finerweb", "euro_glinerx", "finerweb_translated"]:
-        data_files = {
-            d.split('.')[0]: 
-            os.path.join(path, training_dataset, d) for d in os.listdir(f"{path}/{training_dataset}") if d.endswith(".jsonl")
-        }
+    for training_dataset in ["finerweb_4o_jsonl", "finerweb_gemma_jsonl", "finerweb_merged_jsonl"]:
+        if "finerweb" in training_dataset:
+            data_files = {
+                d.split('.')[0]: 
+                os.path.join(path_tmp2, training_dataset, d) for d in os.listdir(f"{path_tmp2}/{training_dataset}") if d.endswith(".jsonl")
+            }
+        else:
+            data_files = {
+                d.split('.')[0]: 
+                os.path.join(path, training_dataset, d) for d in os.listdir(f"{path}/{training_dataset}") if d.endswith(".jsonl")
+            }
         dataset = load_dataset("json", data_files=data_files)
         current_stats = process_dataset_dict(dataset)
         current_stats['dataset'] = training_dataset
@@ -76,17 +87,19 @@ def compute_train():
     print(num_languages_per_dataset)
 
     train_overview_table_for_paper = dataset_stats[dataset_stats['language'] == 'average']
-    train_overview_table_for_paper = train_overview_table_for_paper.set_index('dataset').drop(columns=['language']).T.drop(columns=['finerweb_translated'])
+    train_overview_table_for_paper = train_overview_table_for_paper.set_index('dataset').drop(columns=['language']).T
 
     train_overview_table_for_paper.loc['num_languages'] = num_languages_per_dataset[train_overview_table_for_paper.columns].values
-    column_order = ['nuner', 'pilener', 'euro_glinerx', 'finerweb']
+    column_order = ['nuner', 'pilener', 'euro_glinerx', 'finerweb_4o_jsonl', "finerweb_gemma_jsonl", "finerweb_merged_jsonl"]
     train_overview_table_for_paper = train_overview_table_for_paper[column_order]
 
     column_paper_names = {
         'nuner': 'NuNER',
         'pilener': 'PileNER',
         'euro_glinerx': 'Euro-GLiNER-X',
-        'finerweb': 'FiNERWeb',
+        'finerweb_4o_jsonl': 'FiNERWeb (4O)',
+        'finerweb_gemma_jsonl': 'FiNERWeb (Gemma)',
+        'finerweb_merged_jsonl': 'FiNERWeb (Merged)',
     }
 
     row_paper_names = {
@@ -170,5 +183,5 @@ def compute_eval():
 
 
 if __name__ == "__main__":
-    # compute_train()
-    compute_eval()
+    compute_train()
+    # compute_eval()

@@ -125,6 +125,7 @@ class Binder(PreTrainedModel):
         self.span_loss_weight = config.span_loss_weight
         self.threshold_loss_weight = config.threshold_loss_weight
         self.ner_loss_weight = config.ner_loss_weight
+        self.similarity_loss = config.similarity_loss
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -279,6 +280,7 @@ class Binder(PreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
 
 class BinderDecoder(PreTrainedModel):
     config_class = BinderConfig
@@ -483,27 +485,72 @@ class BinderFocalModel(PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
 
-        hf_config = AutoConfig.from_pretrained(
-            pretrained_model_name_or_path=config.pretrained_model_name_or_path,
-            cache_dir=config.cache_dir,
-            revision=config.revision,
-            use_auth_token=config.use_auth_token,
-            hidden_dropout_prob=config.hidden_dropout_prob,
+        text_config = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path=config.text_encoder,
+            hidden_dropout_prob=config.dropout,
         )
-        self.hf_config = hf_config
-        self.config.pruned_heads = hf_config.pruned_heads
-        self.dropout = torch.nn.Dropout(hf_config.hidden_dropout_prob)
-        self.type_start_linear = torch.nn.Linear(hf_config.hidden_size, config.linear_size)
-        self.type_end_linear = torch.nn.Linear(hf_config.hidden_size, config.linear_size)
-        self.type_span_linear = torch.nn.Linear(hf_config.hidden_size, config.linear_size)
-        self.start_linear = torch.nn.Linear(hf_config.hidden_size, config.linear_size)
-        self.end_linear = torch.nn.Linear(hf_config.hidden_size, config.linear_size)
+        type_config = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path=config.type_encoder,
+            hidden_dropout_prob=config.dropout,
+        )
+        self.text_config = text_config
+        self.type_config = type_config
+        self.dropout = torch.nn.Dropout(config.dropout)
+        # Two-layer feed-forward networks for each projection, with GELU activation and dropout in between
+        self.type_start_ffn = torch.nn.Sequential(
+            torch.nn.Linear(type_config.hidden_size, config.linear_size),
+            torch.nn.GELU(),
+            torch.nn.Dropout(config.dropout),
+            torch.nn.Linear(config.linear_size, config.linear_size),
+            torch.nn.Dropout(config.dropout),
+        )
+        self.type_end_ffn = torch.nn.Sequential(
+            torch.nn.Linear(type_config.hidden_size, config.linear_size),
+            torch.nn.GELU(),
+            torch.nn.Dropout(config.dropout),
+            torch.nn.Linear(config.linear_size, config.linear_size),
+            torch.nn.Dropout(config.dropout),
+        )
+        self.type_span_ffn = torch.nn.Sequential(
+            torch.nn.Linear(type_config.hidden_size, config.linear_size),
+            torch.nn.GELU(),
+            torch.nn.Dropout(config.dropout),
+            torch.nn.Linear(config.linear_size, config.linear_size),
+            torch.nn.Dropout(config.dropout),
+        )
+        self.text_start_ffn = torch.nn.Sequential(
+            torch.nn.Linear(text_config.hidden_size, config.linear_size),
+            torch.nn.GELU(),
+            torch.nn.Dropout(config.dropout),
+            torch.nn.Linear(config.linear_size, config.linear_size),
+            torch.nn.Dropout(config.dropout),
+        )
+        self.text_end_ffn = torch.nn.Sequential(
+            torch.nn.Linear(text_config.hidden_size, config.linear_size),
+            torch.nn.GELU(),
+            torch.nn.Dropout(config.dropout),
+            torch.nn.Linear(config.linear_size, config.linear_size),
+            torch.nn.Dropout(config.dropout),
+        )
         if config.use_span_width_embedding:
-            self.span_linear = torch.nn.Linear(hf_config.hidden_size * 2 + config.linear_size, config.linear_size)
+            self.text_span_ffn = torch.nn.Sequential(
+                torch.nn.Linear(text_config.hidden_size * 2 + config.linear_size, config.linear_size),
+                torch.nn.GELU(),
+                torch.nn.Dropout(config.dropout),
+                torch.nn.Linear(config.linear_size, config.linear_size),
+                torch.nn.Dropout(config.dropout),
+            )
             self.width_embeddings = torch.nn.Embedding(config.max_span_width, config.linear_size, padding_idx=0)
         else:
-            self.span_linear = torch.nn.Linear(hf_config.hidden_size * 2, config.linear_size)
+            self.text_span_ffn = torch.nn.Sequential(
+                torch.nn.Linear(text_config.hidden_size * 2, config.linear_size),
+                torch.nn.GELU(),
+                torch.nn.Dropout(config.dropout),
+                torch.nn.Linear(config.linear_size, config.linear_size),
+                torch.nn.Dropout(config.dropout),
+            )
             self.width_embeddings = None
+
         self.start_logit_scale = torch.nn.Parameter(torch.ones([]) * np.log(1 / config.init_temperature))
         self.end_logit_scale = torch.nn.Parameter(torch.ones([]) * np.log(1 / config.init_temperature))
         self.span_logit_scale = torch.nn.Parameter(torch.ones([]) * np.log(1 / config.init_temperature))
@@ -511,19 +558,17 @@ class BinderFocalModel(PreTrainedModel):
         self.start_loss_weight = config.start_loss_weight
         self.end_loss_weight = config.end_loss_weight
         self.span_loss_weight = config.span_loss_weight
-        self.threshold_loss_weight = config.threshold_loss_weight
-        self.ner_loss_weight = config.ner_loss_weight
 
         # Initialize weights and apply final processing
         self.post_init()
 
         self.text_encoder = AutoModel.from_pretrained(
-            config.pretrained_model_name_or_path,
-            config=hf_config,
+            config.text_encoder,
+            config=text_config,
         )
         self.type_encoder = AutoModel.from_pretrained(
-            config.pretrained_model_name_or_path,
-            config=hf_config,
+            config.type_encoder,
+            config=type_config,
         )
 
     def _init_weights(self, module):
@@ -531,11 +576,11 @@ class BinderFocalModel(PreTrainedModel):
         if isinstance(module, nn.Linear):
             # Slightly different from the TF version which uses truncated_normal for initialization
             # cf https://github.com/pytorch/pytorch/pull/5617
-            module.weight.data.normal_(mean=0.0, std=self.hf_config.initializer_range)
+            module.weight.data.normal_(mean=0.0, std=self.text_config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=self.hf_config.initializer_range)
+            module.weight.data.normal_(mean=0.0, std=self.text_config.initializer_range)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
         elif isinstance(module, nn.LayerNorm):
@@ -545,6 +590,11 @@ class BinderFocalModel(PreTrainedModel):
     def gradient_checkpointing_enable(self):
         self.text_encoder.gradient_checkpointing_enable()
         self.type_encoder.gradient_checkpointing_enable()
+
+    def mean_pooling(self, model_output, attention_mask):
+        token_embeddings = model_output[0]
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
 
     def bce_with_mask(self, logits, targets, mask=None, pos_weight=None, focal_gamma=None, logit_adjust=None):
         """
@@ -582,10 +632,8 @@ class BinderFocalModel(PreTrainedModel):
         type_attention_mask: torch.Tensor = None,
         type_token_type_ids: torch.Tensor = None,
         ner: Optional[Dict] = None,
-        return_dict: bool = None,
+        return_dict: bool = False,
     ):
-        return_dict = return_dict if return_dict is not None else self.hf_config.use_return_dict
-
         outputs = self.text_encoder(
             input_ids,
             attention_mask=attention_mask,
@@ -603,16 +651,17 @@ class BinderFocalModel(PreTrainedModel):
         )
         # num_types x hidden_size
         type_output = type_outputs[0][:, 0]
+        # type_output = self.mean_pooling(type_outputs, type_attention_mask)
 
         batch_size, seq_length, _ = sequence_output.size()
         num_types, _ = type_output.size()
 
         # num_types x hidden_size
-        type_start_output = F.normalize(self.dropout(self.type_start_linear(type_output)), dim=-1)
-        type_end_output = F.normalize(self.dropout(self.type_end_linear(type_output)), dim=-1)
+        type_start_output = F.normalize(self.dropout(self.type_start_ffn(type_output)), dim=-1)
+        type_end_output = F.normalize(self.dropout(self.type_end_ffn(type_output)), dim=-1)
         # batch_size x seq_length x hidden_size
-        sequence_start_output = F.normalize(self.dropout(self.start_linear(sequence_output)), dim=-1)
-        sequence_end_output = F.normalize(self.dropout(self.end_linear(sequence_output)), dim=-1)
+        sequence_start_output = F.normalize(self.dropout(self.text_start_ffn(sequence_output)), dim=-1)
+        sequence_end_output = F.normalize(self.dropout(self.text_end_ffn(sequence_output)), dim=-1)
 
         # batch_size x num_types x seq_length
         start_scores = self.start_logit_scale.exp() * type_start_output.unsqueeze(0) @ sequence_start_output.transpose(1, 2)
@@ -638,61 +687,35 @@ class BinderFocalModel(PreTrainedModel):
 
         # batch_size x seq_length x seq_length x hidden_size
         span_linear_output = F.normalize(
-            self.dropout(self.span_linear(span_output)).view(batch_size, seq_length * seq_length, -1), dim=-1
+            self.dropout(self.text_span_ffn(span_output)).view(batch_size, seq_length * seq_length, -1), dim=-1
         )
         # num_types x hidden_size
-        type_linear_output = F.normalize(self.dropout(self.type_span_linear(type_output)), dim=-1)
+        type_linear_output = F.normalize(self.dropout(self.type_span_ffn(type_output)), dim=-1)
 
         span_scores = self.span_logit_scale.exp() * type_linear_output.unsqueeze(0) @ span_linear_output.transpose(1, 2)
         span_scores = span_scores.view(batch_size, num_types, seq_length, seq_length)
 
         total_loss = None
         if ner is not None:
-            B, T, L = start_scores.shape
-            start_targets = torch.zeros_like(start_scores)   # [B, T, L]
-            end_targets   = torch.zeros_like(end_scores)     # [B, T, L]
-            span_targets  = torch.zeros_like(span_scores)    # [B, T, L, L]
+            start_targets = ner["start_targets"].to(dtype=start_scores.dtype, device=start_scores.device)
+            end_targets = ner["end_targets"].to(dtype=end_scores.dtype, device=end_scores.device)
+            span_targets = ner["span_targets"].to(dtype=span_scores.dtype, device=span_scores.device)
 
-            # Masks (where to compute loss). Start/end/span_negative_mask you already have
-            start_mask = (~ner["start_negative_mask"].bool()).view(B, T, L)  # True=include
-            end_mask   = (~ner["end_negative_mask"].bool()).view(B, T, L)
-            span_mask  = (~ner["span_negative_mask"].bool()).view(B, T, L, L)
+            start_mask = ner["start_valid_mask"].to(device=start_scores.device)
+            end_mask = ner["end_valid_mask"].to(device=end_scores.device)
+            span_mask = ner["span_valid_mask"].to(device=span_scores.device)
 
-            # Positive indices (use your existing tuple indexing pattern)
-            # ner["example_indices"] should be a tuple (batch_idx, type_idx, ...)
-            # For starts/ends, we expect per-positive token positions. For spans, pairs (i,j).
-            b_idx, t_idx = ner["example_indices"]   # both shaped [N_pos] or broadcastable
+            # Optional: dynamic pos_weight per head (handles heavy imbalance)
+            def _pos_weight(targets, mask):
+                # (#neg / #pos) within valid region; clamp to avoid inf/0
+                pos = (targets.bool() & mask).sum().clamp_min(1)
+                neg = (mask.sum() - pos).clamp_min(1)
+                return (neg.float() / pos.float()).detach()
 
-            # START targets
-            # ner_starts is a 1D tensor [N_pos] of token positions (0..L-1) for those (b,t)
-            s_pos = ner["example_starts"]
-            start_targets.index_put_((b_idx, t_idx, s_pos), torch.ones_like(s_pos, dtype=start_targets.dtype), accumulate=True)
+            pos_weight_tok  = _pos_weight(start_targets, start_mask)  # same for end
+            pos_weight_span = _pos_weight(span_targets, span_mask)
 
-            # END targets
-            e_pos = ner["example_ends"]
-            end_targets.index_put_((b_idx, t_idx, e_pos), torch.ones_like(e_pos, dtype=end_targets.dtype), accumulate=True)
-
-            # SPAN targets
-            # For spans, you can reuse the same (b_idx, t_idx) with both start & end coordinates
-            # Suppose ner also gives you separate vectors for starts/ends aligned by example
-            # If not, adapt this to however you store span positions.
-            span_targets.index_put_((b_idx, t_idx, s_pos, e_pos),
-                                    torch.ones_like(s_pos, dtype=span_targets.dtype),
-                                    accumulate=True)
-
-            # Optional: clamp to {0,1} in case of duplicates
-            start_targets.clamp_(0, 1)
-            end_targets.clamp_(0, 1)
-            span_targets.clamp_(0, 1)
-
-            # ===== BCE losses =====
-            # Class imbalance handling (tune these):
-            # Estimate positive prior π ~ (#ones / #mask). Use that to set pos_weight or logit_adjust.
-            # Simple starting point:
-            pos_weight_tok  = torch.tensor(5.0, device=start_scores.device)   # upweight positives
-            pos_weight_span = torch.tensor(10.0, device=start_scores.device)
-
-            focal_gamma = 1.5  # try 1.0–2.0; or set None to disable
+            focal_gamma = 1.0
 
             start_loss_bce = self.bce_with_mask(
                 logits=start_scores, targets=start_targets, mask=start_mask,

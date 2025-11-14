@@ -23,8 +23,9 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint
 
 from src.config import BinderConfig
-from src.model import Binder, BinderDecoder
-from src.trainer import BinderDataCollator, BinderTrainer
+from src.model import Binder
+from src.collator import BinderDataCollator
+from src.trainer import BinderTrainer
 from src import utils as postprocess_utils
 
 
@@ -87,6 +88,9 @@ class ModelArguments:
     )
     ner_loss_weight: float = field(
         default=0.5, metadata={"help": "NER loss weight."}
+    )
+    similarity_loss: bool = field(
+        default=False, metadata={"help": "Use similarity loss."}
     )
 
 
@@ -321,10 +325,7 @@ def main():
         threshold_loss_weight=model_args.threshold_loss_weight,
         ner_loss_weight=model_args.ner_loss_weight,
     )
-    if model_args.model_name_or_path == "google/gemma-3-270M":
-        model = BinderDecoder(config)
-    else:
-        model = Binder(config)
+    model = Binder(config)
 
     # Tokenizer check: this script requires a fast tokenizer.
     if not isinstance(tokenizer, PreTrainedTokenizerFast):

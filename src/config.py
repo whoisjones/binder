@@ -19,6 +19,7 @@ class BinderConfig(PretrainedConfig):
         span_loss_weight=0.6,
         threshold_loss_weight=0.5,
         ner_loss_weight=0.5,
+        similarity_loss=False,
         **kwargs,
     ):
         self.pretrained_model_name_or_path = pretrained_model_name_or_path
@@ -35,6 +36,7 @@ class BinderConfig(PretrainedConfig):
         self.span_loss_weight = span_loss_weight
         self.threshold_loss_weight = threshold_loss_weight
         self.ner_loss_weight = ner_loss_weight
+        self.similarity_loss = similarity_loss
         super().__init__(**kwargs)
 
 class BinderFocalConfig(PretrainedConfig):
@@ -51,6 +53,7 @@ class BinderFocalConfig(PretrainedConfig):
         start_loss_weight=0.2,
         end_loss_weight=0.2,
         span_loss_weight=0.6,
+        init_temperature=0.07,
         **kwargs,
     ):
         self.text_encoder = text_encoder
@@ -62,4 +65,5 @@ class BinderFocalConfig(PretrainedConfig):
         self.start_loss_weight = start_loss_weight
         self.end_loss_weight = end_loss_weight
         self.span_loss_weight = span_loss_weight
+        self.init_temperature = init_temperature
         super().__init__(**kwargs)

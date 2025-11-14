@@ -1,10 +1,7 @@
 import logging
-from typing import Any, List, Dict, Union
-from dataclasses import dataclass
+from typing import Any, Dict, Union
 
 import torch
-from torch.utils.data import DataLoader
-from transformers import PreTrainedTokenizer
 from transformers.trainer import Trainer
 from transformers.trainer_utils import PredictionOutput
 

@@ -122,3 +122,78 @@ class BinderDataCollator:
             batch['ner'] = ner
 
         return batch
+
+@dataclass
+class BinderFocalDataCollator:
+    type_tokenizer: PreTrainedTokenizer
+    id2label: dict[str, dict[int, str]]
+
+    def __call__(self, features: List) -> Dict[str, Any]:
+        batch = {}
+        stage = features[0]['split']
+
+        batch['input_ids'] = torch.tensor([f['input_ids'] for f in features], dtype=torch.long)
+        batch['attention_mask'] = torch.tensor([f['attention_mask'] for f in features], dtype=torch.bool)
+        if "token_type_ids" in features[0]:
+            batch['token_type_ids'] = torch.tensor([f['token_type_ids'] for f in features], dtype=torch.long)
+
+        if stage == 'train':
+            batch_labels = set([ann['type'] for feature in features for ann in feature['ner']])
+            batch_id2label = {i: label for i, label in enumerate(batch_labels)}
+            batch_label2id = {label: i for i, label in enumerate(batch_labels)}
+        elif stage == 'eval' or stage == 'predict':
+            batch_id2label = self.id2label[stage]
+            batch_label2id = {v: k for k, v in batch_id2label.items()}
+        else:
+            raise ValueError(f"Unknown stage: {stage}")
+
+        tokenized_labels = self.type_tokenizer(
+            list(batch_id2label.values()),
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+        )
+        batch['type_input_ids'] = tokenized_labels['input_ids']
+        batch['type_attention_mask'] = tokenized_labels['attention_mask']
+        if 'token_type_ids' in tokenized_labels:
+            batch['type_token_type_ids'] = tokenized_labels['token_type_ids']
+        
+
+        if stage == 'train':
+            B = len(features); T = len(batch_id2label); L = len(features[0]['token_start_mask'])
+            start_valid_mask = torch.zeros((B, T, L), dtype=torch.bool)
+            end_valid_mask   = torch.zeros((B, T, L), dtype=torch.bool)
+            span_valid_mask  = torch.zeros((B, T, L, L), dtype=torch.bool)
+
+            start_targets = torch.zeros((B, T, L), dtype=torch.float32)
+            end_targets   = torch.zeros((B, T, L), dtype=torch.float32)
+            span_targets  = torch.zeros((B, T, L, L), dtype=torch.float32)
+
+            for b, feat in enumerate(features):
+                token_start_mask = torch.tensor(feat['token_start_mask'], dtype=torch.bool)     # True where valid token (not pad)
+                token_end_mask   = torch.tensor(feat['token_end_mask'], dtype=torch.bool)
+                default_span_mask = torch.tensor(feat['default_span_mask'], dtype=torch.bool)   # [L, L], True where valid (i<=j etc.)
+
+                # validity (same for every type in this example)
+                start_valid_mask[b, :, :] = token_start_mask.unsqueeze(0).expand(T, -1)
+                end_valid_mask[b, :, :] = token_end_mask  .unsqueeze(0).expand(T, -1)
+                span_valid_mask[b, :, :, :] = default_span_mask.unsqueeze(0).expand(T, -1, -1)
+
+                # positives
+                for ann in feat['ner']:
+                    t = batch_label2id[ann['type']]
+                    i, j = ann['start'], ann['end']
+                    start_targets[b, t, i] = 1.0
+                    end_targets[b, t, j]   = 1.0
+                    span_targets[b, t, i, j] = 1.0
+            
+            batch['ner'] = {
+                "start_targets": start_targets,
+                "end_targets": end_targets,
+                "span_targets": span_targets,
+                "start_valid_mask": start_valid_mask,
+                "end_valid_mask": end_valid_mask,
+                "span_valid_mask": span_valid_mask,
+            }
+
+        return batch

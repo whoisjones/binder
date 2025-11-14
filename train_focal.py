@@ -22,8 +22,9 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint
 
 from src.config import BinderFocalConfig
+from src.collator import BinderFocalDataCollator
 from src.model import BinderFocalModel
-from src.trainer import BinderFocalDataCollator, BinderTrainer
+from src.trainer import BinderTrainer
 from src import utils as postprocess_utils
 
 
@@ -35,9 +36,6 @@ class ModelArguments:
     """
     Arguments for Binder.
     """
-    model_class: str = field(
-        metadata={"help": "Model class to use."}
-    )
     text_encoder: str = field(
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
@@ -146,7 +144,7 @@ class DataTrainingArguments:
         },
     )
     prediction_postprocess_func: Optional[str] = field(
-        default="postprocess_nested_predictions",
+        default="postprocess_flat_bce_predictions",
         metadata={"help": "The name of prediction postprocess function."},
     )
     wandb_project: Optional[str] = field(
@@ -206,22 +204,29 @@ def main():
 
     set_seed(training_args.seed)
 
-    if isinstance(data_args.train_file, str) and data_args.train_file.endswith(".json"):
-        data_files = {}
-        if data_args.train_file is not None:
-            extension = data_args.train_file.split(".")[-1]
-            data_files["train"] = data_args.train_file
-        if data_args.validation_file is not None:
-            data_files["validation"] = data_args.validation_file
-            extension = data_args.validation_file.split(".")[-1]
-        raw_datasets = load_dataset(extension, data_files=data_files, cache_dir=model_args.cache_dir)
-    else:
-        data_files = {}
-        for dataset_name in data_args.train_file:
-            model_name = model_args.text_encoder.split("/")[-1]
-            data_files[dataset_name] = Dataset.load_from_disk(f"/vol/tmp/goldejon/multilingual_ner/binder/data/training/tokenized/{model_name}/{dataset_name}")
-        train_dataset = concatenate_datasets(data_files.values())
-        raw_datasets = DatasetDict({"train": train_dataset})
+    dataset_files = {}
+
+    train_files = {}
+    for dataset_name in data_args.train_file:
+        model_name = model_args.text_encoder.split("/")[-1]
+        if model_name == "xlm-roberta-large":
+            model_name = "xlm-roberta-base"
+        train_files[dataset_name] = Dataset.load_from_disk(f"/vol/tmp/goldejon/multilingual_ner/binder/data/training/tokenized/{model_name}/{dataset_name}")
+    dataset_files["train"] = concatenate_datasets(train_files.values())
+
+    if data_args.validation_file is not None:
+        val_files = {}
+        val_dir = "/vol/tmp/goldejon/multilingual_ner/binder/data/evaluation/"
+        val_dir = os.path.join(val_dir, data_args.validation_file)
+        val_files = {d.split(".")[0]: os.path.join(val_dir, d) for d in os.listdir(val_dir)}
+        val_dataset = load_dataset("json", data_files=val_files)
+        max_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else 500
+        for language in val_dataset.keys():
+            val_dataset[language] = val_dataset[language].shuffle(seed=42).select(range(max_samples // len(val_dataset.keys())))
+        val_dataset = concatenate_datasets(val_dataset.values())
+        dataset_files["validation"] = val_dataset
+
+    raw_datasets = DatasetDict(dataset_files)
 
     if training_args.do_train:
         if "train" not in raw_datasets:
@@ -249,21 +254,34 @@ def main():
 
     id2label = {}
     if training_args.do_eval and "validation" in raw_datasets:
-        dev_labels = set([label["type"] for labels in raw_datasets["validation"]['ner'] for label in labels])
+        dev_labels = set([label for labels in raw_datasets["validation"]['entity_types'] for label in labels])
         id2label['eval'] = {i: label for i, label in enumerate(dev_labels)}
 
-    tokenizer = AutoTokenizer.from_pretrained(
+        if "id" in raw_datasets["validation"].column_names:
+            raw_datasets["validation"] = raw_datasets["validation"].remove_columns("id")
+
+        raw_datasets["validation"] = raw_datasets["validation"].add_column(
+            name="id",
+            column=[f"eval_{i}" for i in range(len(raw_datasets["validation"]))]
+        )
+
+    train_dataset = raw_datasets["train"]
+
+    text_tokenizer = AutoTokenizer.from_pretrained(
         model_args.text_tokenizer if model_args.text_tokenizer else model_args.text_encoder,
-        cache_dir=model_args.cache_dir,
         use_fast=True,
-        revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
-        add_prefix_space=True,
+        add_prefix_space=True if "roberta" in model_args.text_encoder else False,
+    )
+
+    type_tokenizer = AutoTokenizer.from_pretrained(
+        model_args.type_tokenizer if model_args.type_tokenizer else model_args.type_encoder,
+        use_fast=True,
+        add_prefix_space=True if "roberta" in model_args.type_encoder else False,
     )
     
     config = BinderFocalConfig(
-        text_encoder=model_args.config_name if model_args.config_name else model_args.text_encoder,
-        type_encoder=model_args.type_encoder if model_args.type_encoder else model_args.type_encoder,
+        text_encoder=model_args.text_encoder,
+        type_encoder=model_args.type_encoder,
         dropout=model_args.dropout,
         max_span_width=data_args.max_seq_length + 1,
         use_span_width_embedding=model_args.use_span_width_embedding,
@@ -278,7 +296,7 @@ def main():
         # Tokenize our examples with truncation and maybe padding, but keep the overflows using a stride. This results
         # in one example possible giving several features when a context is long, each of those features having a
         # context that overlaps a bit the context of the previous feature.
-        tokenized_examples = tokenizer(
+        tokenized_examples = text_tokenizer(
             examples["text"],
             truncation=True,
             max_length=data_args.max_seq_length,
@@ -298,6 +316,7 @@ def main():
         tokenized_examples["example_id"] = []
         tokenized_examples["token_start_mask"] = []
         tokenized_examples["token_end_mask"] = []
+        tokenized_examples["default_span_mask"] = []
 
         for i in range(len(tokenized_examples["input_ids"])):
             tokenized_examples["split"].append(split)
@@ -325,6 +344,15 @@ def main():
             tokenized_examples["token_start_mask"].append(token_start_mask)
             tokenized_examples["token_end_mask"].append(token_end_mask)
 
+            default_span_mask = [
+                [
+                    (j - i >= 0) * s * e for j, e in enumerate(token_end_mask)
+                ]
+                for i, s in enumerate(token_start_mask)
+            ]
+
+            tokenized_examples["default_span_mask"].append(default_span_mask)
+
             # Set to None the offset_mapping that are not part of the text so it's easy to determine if a token
             # position is part of the text or not.
             tokenized_examples["offset_mapping"][i] = [
@@ -334,7 +362,7 @@ def main():
 
         return tokenized_examples
 
-    if training_args.do_eval and "input_ids" not in raw_datasets["validation"].column_names:
+    if training_args.do_eval:
         if "validation" not in raw_datasets:
             raise ValueError("--do_eval requires a validation dataset")
         eval_examples = raw_datasets["validation"]
@@ -351,9 +379,9 @@ def main():
                 load_from_cache_file=not data_args.overwrite_cache,
                 desc="Running tokenizer on validation dataset",
             )
-
+    
     # Data collator
-    data_collator = BinderFocalDataCollator(tokenizer=tokenizer, id2label=id2label)
+    data_collator = BinderFocalDataCollator(type_tokenizer=type_tokenizer, id2label=id2label)
 
     # Post-processing:
     def post_processing_function(examples, features, predictions, stage=f"eval"):
@@ -367,7 +395,7 @@ def main():
             output_dir=training_args.output_dir if training_args.should_save else None,
             log_level=log_level,
             prefix=stage,
-            tokenizer=tokenizer,
+            tokenizer=text_tokenizer,
             train_file=data_args.train_file,
         )
 
@@ -380,7 +408,7 @@ def main():
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
         eval_examples=eval_examples if training_args.do_eval else None,
-        tokenizer=tokenizer,
+        tokenizer=text_tokenizer,
         data_collator=data_collator,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=20)] if training_args.do_eval else None,
         post_process_function=post_processing_function,

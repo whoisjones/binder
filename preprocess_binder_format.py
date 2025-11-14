@@ -1,4 +1,4 @@
-from datasets import Dataset, DatasetDict
+from datasets import Dataset, DatasetDict, load_dataset, concatenate_datasets
 import os
 import numpy as np
 from tqdm import tqdm
@@ -83,10 +83,17 @@ def evaluation_datasets():
             test_split.to_json(f'/vol/tmp/goldejon/multilingual_ner/binder/data/evaluation_translated/{dataset_name}/{language}.json', orient="records", lines=True)
 
 def train_datasets():
-    dataset_name = "euro_glinerx"
-    dataset = Dataset.load_from_disk(f"/vol/tmp/goldejon/multilingual_ner/data/training_hf/{dataset_name}")
+    # dataset_name = "euro_glinerx"
+    # dataset = Dataset.load_from_disk(f"/vol/tmp/goldejon/multilingual_ner/data/training_hf/{dataset_name}")
+    path = "/vol/tmp/goldejon/multilingual_ner/data/finerweb/finerweb_final/gemma"
+    data_files = {
+        d.split('.')[0]: 
+        os.path.join(path, d) for d in os.listdir(path) if d.endswith(".jsonl")
+    }
+    dataset = load_dataset("json", data_files=data_files)
+    dataset = concatenate_datasets(dataset.values())
 
-    # Map in batches for speed
+    # Map in batches for speeds
     dataset = dataset.map(
         process_batch,
         with_indices=True,
@@ -97,8 +104,8 @@ def train_datasets():
 
     dataset = dataset.remove_columns(["tokens", "spans_tokens", "spans_char"])
     os.makedirs(f"/vol/tmp/goldejon/multilingual_ner/binder/data/training", exist_ok=True)
-    dataset.to_json(f'/vol/tmp/goldejon/multilingual_ner/binder/data/training/{dataset_name}.json', orient="records", lines=True)
+    dataset.to_json(f'/vol/tmp/goldejon/multilingual_ner/binder/data/training/gemma.json', orient="records", lines=True)
 
 if __name__ == "__main__":
-    # train_datasets()
-    evaluation_datasets()
+    train_datasets()
+    # evaluation_datasets()

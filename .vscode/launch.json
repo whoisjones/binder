@@ -7,10 +7,10 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "args": [
-                "conf/panx.json"
+                "conf/conll03-train.json"
             ],
             "env": {
-                "CUDA_VISIBLE_DEVICES": "0"
+                "CUDA_VISIBLE_DEVICES": "3"
             }
         }
     ]

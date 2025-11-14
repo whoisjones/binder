@@ -7,11 +7,12 @@
     "dataset_entity_types": null,
     "report_to": "none",
     "prediction_postprocess_func": "postprocess_flat_predictions",
+    "similarity_loss": true,
     "max_seq_length": 256,
     "use_span_width_embedding": true,
     "doc_stride": 16,
-    "preprocessing_num_workers": 64,
-    "dataloader_num_workers": 64,
+    "preprocessing_num_workers": 16,
+    "dataloader_num_workers": 16,
     "overwrite_cache": false,
     "overwrite_output_dir": true,
     "do_train": true,
@@ -38,6 +39,6 @@
     "eval_strategy": "no",
     "eval_steps": 100,
     "do_predict": false,
-    "output_dir": "/vol/tmp/goldejon/multilingual_ner/binder/models/baseline/contrastive",
+    "output_dir": "/vol/tmp/goldejon/multilingual_ner/binder/models/baseline/contrastive_similarity",
     "remove_unused_columns": false
 }
